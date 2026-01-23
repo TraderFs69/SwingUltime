@@ -7,6 +7,7 @@ import requests
 # CONFIG
 # =====================================================
 st.set_page_config(layout="wide")
+
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 
@@ -56,7 +57,6 @@ def get_ohlc(ticker):
     )
     try:
         r = requests.get(url, timeout=10)
-
         if r.status_code != 200:
             return None
         if not r.text or r.text[0] != "{":
@@ -217,7 +217,7 @@ def send_to_discord(df):
     lines = []
     for _, r in df.iterrows():
         lines.append(
-            f"**{r['Ticker']}** | "
+            f"**{r['Ticker']}** @ ${r['Price']} | "
             f"Score `{r['Score Global']}` | "
             f"Size `{r['Position Size (%)']}%` | "
             f"{r['Risk Flag']}"
@@ -243,6 +243,8 @@ def scan_universe(tickers):
         if df is None or len(df) < 60:
             continue
 
+        last_price = round(df["Close"].iloc[-1], 2)
+
         s1, s2 = strategy1(df), strategy2(df)
         s3, s4 = strategy3(df), strategy4(df)
 
@@ -254,15 +256,21 @@ def scan_universe(tickers):
         size = position_size(total, flags)
 
         rows.append([
-            t, s1, s2, s3, s4,
+            t,
+            last_price,
+            s1, s2, s3, s4,
             total,
             " | ".join(flags) if flags else "—",
             size
         ])
 
     return pd.DataFrame(rows, columns=[
-        "Ticker","S1","S2","S3","S4",
-        "Score Global","Risk Flag","Position Size (%)"
+        "Ticker",
+        "Price",
+        "S1","S2","S3","S4",
+        "Score Global",
+        "Risk Flag",
+        "Position Size (%)"
     ])
 
 # =====================================================
