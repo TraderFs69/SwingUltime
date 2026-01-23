@@ -12,6 +12,7 @@ POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 LOOKBACK = 140
 TOP_N = 20
 
+# Pondérations
 W_S1, W_S2, W_S3, W_S4 = 0.30, 0.25, 0.25, 0.20
 
 # =====================================================
@@ -22,7 +23,7 @@ def load_tickers():
     try:
         df = pd.read_excel("russell3000_constituents.xlsx", usecols=["Symbol"])
         s = df["Symbol"]
-    except:
+    except Exception:
         df = pd.read_excel(
             "russell3000_constituents.xlsx",
             header=None,
@@ -39,12 +40,13 @@ def load_tickers():
         .tolist()
     )
 
+    # Sécurité si "Symbol" apparaît comme valeur
     return [t for t in tickers if t != "SYMBOL"]
 
 TICKERS = load_tickers()
 
 # =====================================================
-# POLYGON OHLC
+# POLYGON OHLC (BULLETPROOF)
 # =====================================================
 @st.cache_data(ttl=3600)
 def get_ohlc(ticker):
@@ -53,19 +55,39 @@ def get_ohlc(ticker):
         f"{LOOKBACK}/2025-01-01"
         f"?adjusted=true&sort=asc&apiKey={POLYGON_KEY}"
     )
-    r = requests.get(url, timeout=10).json()
-    if "results" not in r:
-        return None
 
-    df = pd.DataFrame(r["results"])
-    df["Close"] = df["c"]
-    return df
+    try:
+        r = requests.get(url, timeout=10)
+
+        # Mauvaise réponse HTTP
+        if r.status_code != 200:
+            return None
+
+        # Réponse vide ou HTML
+        if not r.text or r.text[0] != "{":
+            return None
+
+        data = r.json()
+
+        if "results" not in data or not data["results"]:
+            return None
+
+        df = pd.DataFrame(data["results"])
+        df["Close"] = df["c"]
+
+        return df
+
+    except Exception:
+        return None
 
 # =====================================================
 # INDICATEURS
 # =====================================================
-def EMA(s, n): return s.ewm(span=n, adjust=False).mean()
-def ROC(s, n): return s.pct_change(n) * 100
+def EMA(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+def ROC(s, n):
+    return s.pct_change(n) * 100
 
 def RSI(s, n=14):
     d = s.diff()
@@ -83,17 +105,18 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# STRATÉGIE 1
+# STRATÉGIE 1 — DYNAMIQUE (P, P', P'')
 # =====================================================
 def strategy1(df):
-    c = df["Close"]
-    ema20, ema50 = EMA(c,20), EMA(c,50)
-    roc5, roc10 = ROC(c,5), ROC(c,10)
-    rsi = RSI(c)
-    i = -1
-
     if len(df) < 60:
-        return 0
+        return 0.0
+
+    c = df["Close"]
+    ema20, ema50 = EMA(c, 20), EMA(c, 50)
+    roc5, roc10 = ROC(c, 5), ROC(c, 10)
+    rsi = RSI(c)
+
+    i = -1
 
     p = sum([
         c.iloc[i] > ema50.iloc[i],
@@ -115,42 +138,44 @@ def strategy1(df):
         rsi.iloc[i] - rsi.iloc[i-5] > 0,
         (ema20.iloc[i] - ema50.iloc[i]) >
         (ema20.iloc[i-5] - ema50.iloc[i-5]),
-        ROC(ROC(c,5),5).iloc[i] > 0
+        ROC(ROC(c, 5), 5).iloc[i] > 0
     ])
 
     return round((p + v + a) / 12 * 100, 2)
 
 # =====================================================
-# STRATÉGIE 2
+# STRATÉGIE 2 — TENDANCE & STRUCTURE
 # =====================================================
 def strategy2(df):
-    c = df["Close"]
-    ema50, ema100, ema200 = EMA(c,50), EMA(c,100), EMA(c,200)
-    i = -1
-
     if len(df) < 200:
-        return 0
+        return 0.0
+
+    c = df["Close"]
+    ema50, ema100, ema200 = EMA(c, 50), EMA(c, 100), EMA(c, 200)
+
+    i = -1
 
     s = sum([
         c.iloc[i] > ema200.iloc[i],
         ema50.iloc[i] > ema100.iloc[i] > ema200.iloc[i],
         ema200.iloc[i] > ema200.iloc[i-20],
-        EMA(c,20).iloc[i] > EMA(c,20).iloc[i-10]
+        EMA(c, 20).iloc[i] > EMA(c, 20).iloc[i-10]
     ])
 
     return round(s / 4 * 100, 2)
 
 # =====================================================
-# STRATÉGIE 3
+# STRATÉGIE 3 — RISQUE & TIMING
 # =====================================================
 def strategy3(df):
-    c = df["Close"]
-    ema20 = EMA(c,20)
-    atr = ATR(df)
-    i = -1
-
     if len(df) < 40:
-        return 0
+        return 0.0
+
+    c = df["Close"]
+    ema20 = EMA(c, 20)
+    atr = ATR(df)
+
+    i = -1
 
     s = sum([
         atr.iloc[i] / c.iloc[i] < 0.04,
@@ -162,16 +187,17 @@ def strategy3(df):
     return round(s / 4 * 100, 2)
 
 # =====================================================
-# STRATÉGIE 4
+# STRATÉGIE 4 — PARTICIPATION
 # =====================================================
 def strategy4(df):
-    i = -1
+    if len(df) < 60:
+        return 0.0
+
     close = df["Close"]
     rv = df["v"] / df["v"].rolling(20).mean()
     gap = (df["o"] - df["Close"].shift()) / df["Close"].shift() * 100
 
-    if len(df) < 60:
-        return 0
+    i = -1
 
     score = sum([
         rv.iloc[i] > 1.3,
@@ -189,9 +215,11 @@ def strategy4(df):
 # =====================================================
 def risk_flag(df):
     flags = []
+
     c = df["Close"]
-    ema20 = EMA(c,20)
+    ema20 = EMA(c, 20)
     atr = ATR(df)
+
     i = -1
 
     if atr.iloc[i] / c.iloc[i] > 0.06:
@@ -221,7 +249,7 @@ def position_size(score, flags):
             "High ATR": 0.7,
             "Gap": 0.75,
             "Extended": 0.8
-        }.get(f, 1)
+        }.get(f, 1.0)
 
     return round(min(base * mult, 1.0) * 100, 1)
 
@@ -242,7 +270,7 @@ def scan_universe(tickers):
         s4 = strategy4(df)
 
         total = round(
-            W_S1*s1 + W_S2*s2 + W_S3*s3 + W_S4*s4,
+            W_S1 * s1 + W_S2 * s2 + W_S3 * s3 + W_S4 * s4,
             2
         )
 
@@ -250,14 +278,21 @@ def scan_universe(tickers):
         size = position_size(total, flags)
 
         rows.append([
-            t, s1, s2, s3, s4, total,
+            t, s1, s2, s3, s4,
+            total,
             " | ".join(flags) if flags else "—",
             size
         ])
 
     return pd.DataFrame(rows, columns=[
-        "Ticker","S1","S2","S3","S4",
-        "Score Global","Risk Flag","Position Size (%)"
+        "Ticker",
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "Score Global",
+        "Risk Flag",
+        "Position Size (%)"
     ])
 
 # =====================================================
@@ -265,7 +300,12 @@ def scan_universe(tickers):
 # =====================================================
 st.title("📊 Swing Scanner — Score, Risk & Position Size")
 
-limit = st.slider("Nombre de tickers à scanner", 50, len(TICKERS), 300)
+limit = st.slider(
+    "Nombre de tickers à scanner",
+    min_value=50,
+    max_value=len(TICKERS),
+    value=300
+)
 
 if st.button("Lancer le scan"):
     with st.spinner("Scan en cours…"):
