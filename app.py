@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import requests
 from datetime import date, timedelta
 
@@ -13,7 +12,8 @@ POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
 DISCORD_WEBHOOK = st.secrets.get("DISCORD_WEBHOOK_URL")
 
 LOOKBACK = 160
-TOP_N = 15
+TOP_N = 30          # élargi
+DELTA_MIN = 5       # accélération minimale
 
 W_S1, W_S2, W_S3, W_S4 = 0.30, 0.25, 0.25, 0.20
 
@@ -23,21 +23,13 @@ W_S1, W_S2, W_S3, W_S4 = 0.30, 0.25, 0.25, 0.20
 @st.cache_data
 def load_tickers():
     df = pd.read_excel("russell3000_constituents.xlsx")
-    s = df.iloc[:, 0]
-    tickers = (
-        s.dropna()
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .unique()
-        .tolist()
-    )
-    return [t for t in tickers if t != "SYMBOL"]
+    t = df.iloc[:, 0].dropna().astype(str).str.upper()
+    return [x for x in t.unique() if x != "SYMBOL"]
 
 TICKERS = load_tickers()
 
 # =====================================================
-# POLYGON OHLC — DATES DYNAMIQUES
+# POLYGON OHLC
 # =====================================================
 @st.cache_data(ttl=3600)
 def get_ohlc(ticker):
@@ -46,8 +38,7 @@ def get_ohlc(ticker):
 
     url = (
         f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
-        f"{start}/{end}"
-        f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
+        f"{start}/{end}?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
     )
 
     try:
@@ -55,9 +46,8 @@ def get_ohlc(ticker):
         if r.status_code != 200:
             return None
         data = r.json()
-        if "results" not in data or not data["results"]:
+        if "results" not in data:
             return None
-
         df = pd.DataFrame(data["results"])
         df["Close"] = df["c"]
         return df
@@ -86,7 +76,7 @@ def ATR(df, n=14):
     return tr.rolling(n).mean()
 
 # =====================================================
-# STRATÉGIES
+# STRATÉGIES (inchangées)
 # =====================================================
 def strategy1(df):
     if len(df) < 60: return 0
@@ -165,7 +155,7 @@ def strategy4(df):
     return round(s/6*100,2)
 
 # =====================================================
-# SCORE GLOBAL (OFFSET)
+# SCORE GLOBAL
 # =====================================================
 def compute_score(df, offset):
     df = df.iloc[:offset]
@@ -174,10 +164,10 @@ def compute_score(df, offset):
     return round(W_S1*s1 + W_S2*s2 + W_S3*s3 + W_S4*s4, 2)
 
 # =====================================================
-# SCAN — NOUVEAUX ENTRANTS UNIQUEMENT
+# SCAN
 # =====================================================
 def scan_universe(tickers):
-    today, yesterday = [], []
+    rows = []
 
     for t in tickers:
         df = get_ohlc(t)
@@ -186,59 +176,36 @@ def scan_universe(tickers):
 
         price = round(df["Close"].iloc[-1], 2)
         score_today = compute_score(df, -1)
-        score_yesterday = compute_score(df, -2)
+        score_week = compute_score(df, -5)
 
-        today.append([t, price, score_today])
-        yesterday.append([t, score_yesterday])
+        rows.append([t, price, score_today, score_today - score_week])
 
-    df_today = pd.DataFrame(today, columns=["Ticker","Price","Score"])
-    df_yesterday = pd.DataFrame(yesterday, columns=["Ticker","Score_Y"])
+    df_all = pd.DataFrame(
+        rows, columns=["Ticker","Price","Score","Delta"]
+    )
 
-    top_today = df_today.sort_values("Score", ascending=False).head(TOP_N)
-    top_yesterday = df_yesterday.sort_values("Score_Y", ascending=False).head(TOP_N)
+    top_ranking = df_all.sort_values("Score", ascending=False).head(TOP_N)
+    accelerators = df_all[df_all["Delta"] > DELTA_MIN] \
+        .sort_values("Delta", ascending=False)
 
-    new_entries = top_today[
-        ~top_today["Ticker"].isin(top_yesterday["Ticker"])
-    ]
-
-    return new_entries.sort_values("Score", ascending=False)
-
-# =====================================================
-# DISCORD
-# =====================================================
-def send_to_discord(df):
-    if not DISCORD_WEBHOOK or df.empty:
-        return
-
-    lines = [
-        f"🚀 **{r['Ticker']}** @ ${r['Price']} | Score `{r['Score']}`"
-        for _, r in df.iterrows()
-    ]
-
-    payload = {
-        "content": "🚨 **NOUVEAUX ENTRANTS — Swing Scanner**\n\n" +
-                   "\n".join(lines)
-    }
-
-    try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
-    except Exception:
-        pass
+    return top_ranking, accelerators
 
 # =====================================================
 # UI
 # =====================================================
-st.title("🚨 Swing Scanner — Nouveaux entrants seulement")
+st.title("🚀 Swing Scanner — Ranking & Accélération")
 
-limit = st.slider("Nombre de tickers à scanner", 50, len(TICKERS), 300)
+limit = st.slider("Nombre de tickers", 50, len(TICKERS), 300)
 
-if st.button("🚀 Lancer le scan et envoyer sur Discord"):
+if st.button("🚀 Lancer le scan"):
     with st.spinner("Scan en cours…"):
-        df = scan_universe(TICKERS[:limit])
+        top, accel = scan_universe(TICKERS[:limit])
 
-        if not df.empty:
-            st.dataframe(df, use_container_width=True)
-            send_to_discord(df)
-            st.success("🚀 Nouveaux entrants envoyés sur Discord")
-        else:
-            st.info("Aucun nouveau titre dans le TOP aujourd’hui.")
+        st.subheader("🏆 TOP RANKING")
+        st.dataframe(top, use_container_width=True)
+
+        st.subheader("⚡ ACCÉLÉRATEURS (Δ score)")
+        st.dataframe(accel, use_container_width=True)
+
+        if top.empty and accel.empty:
+            st.info("Aucun signal significatif aujourd’hui.")
