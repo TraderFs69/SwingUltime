@@ -1,5 +1,5 @@
 # =====================================================
-# SWING SCANNER — RANKING & ACCÉLÉRATION (STABLE)
+# SWING SCANNER — RANKING & ACCÉLÉRATION + DISCORD
 # =====================================================
 import streamlit as st
 import pandas as pd
@@ -12,14 +12,15 @@ st.set_page_config(layout="wide")
 st.title("🚀 Swing Scanner — Ranking & Accélération")
 
 POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
+DISCORD_WEBHOOK = st.secrets["DISCORD_WEBHOOK_URL"]
 
 LOOKBACK = 160
-TOP_N = 30
+TOP_N = 10
 DELTA_MIN = 5
 
-# ---------------- SESSION HTTP ----------------
+# ---------------- SESSION ----------------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TradingEnAction-Scanner/1.0"})
+SESSION.headers.update({"User-Agent": "TradingEnAction-SwingRanking/1.0"})
 
 # ---------------- LOAD TICKERS ----------------
 @st.cache_data
@@ -36,7 +37,7 @@ def load_tickers():
 
 TICKERS = load_tickers()
 
-# ---------------- POLYGON OHLC ----------------
+# ---------------- POLYGON ----------------
 def get_ohlc(ticker, retries=2):
     end = date.today()
     start = end - timedelta(days=LOOKBACK)
@@ -62,15 +63,17 @@ def get_ohlc(ticker, retries=2):
 
         except requests.exceptions.Timeout:
             time.sleep(0.5)
-
         except Exception:
             return None
 
     return None
 
 # ---------------- INDICATEURS ----------------
-def EMA(s, n): return s.ewm(span=n, adjust=False).mean()
-def ROC(s, n): return s.pct_change(n) * 100
+def EMA(s, n): 
+    return s.ewm(span=n, adjust=False).mean()
+
+def ROC(s, n): 
+    return s.pct_change(n) * 100
 
 def compute_score(df):
     c = df["Close"]
@@ -82,15 +85,30 @@ def compute_score(df):
     ])
     return round(score / 4 * 100, 2)
 
+# ---------------- DISCORD ----------------
+def send_discord_ranking(df):
+    lines = ["🏆 **SWING RANKING — TOP 10**\n"]
+
+    for i, row in enumerate(df.itertuples(), 1):
+        lines.append(
+            f"{i}️⃣ **{row.Ticker}** — Score {row.Score} — Δ {row.Delta:+}"
+        )
+
+    lines.append("\n⏱ Scan journalier — Trading en Action")
+
+    payload = {"content": "\n".join(lines)}
+
+    try:
+        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
+    except Exception:
+        pass
+
 # ---------------- SCAN ----------------
 def scan_universe(tickers):
     rows = []
     progress = st.progress(0)
-    status = st.empty()
 
     for i, t in enumerate(tickers):
-        status.write(f"{i+1}/{len(tickers)} — {t}")
-
         df = get_ohlc(t)
         if df is None or len(df) < 100:
             continue
@@ -107,18 +125,30 @@ def scan_universe(tickers):
 
         progress.progress((i + 1) / len(tickers))
 
-    df_all = pd.DataFrame(rows, columns=["Ticker", "Price", "Score", "Delta"])
-
-    return (
-        df_all.sort_values("Score", ascending=False).head(TOP_N),
-        df_all[df_all["Delta"] > DELTA_MIN].sort_values("Delta", ascending=False)
+    return pd.DataFrame(
+        rows, columns=["Ticker", "Price", "Score", "Delta"]
     )
 
 # ---------------- UI ----------------
 limit = st.slider("Nombre de tickers", 50, len(TICKERS), 200)
 
 if st.button("🚀 Scanner Swing"):
-    top, accel = scan_universe(TICKERS[:limit])
+    df_all = scan_universe(TICKERS[:limit])
+
+    top = (
+        df_all
+        .sort_values("Score", ascending=False)
+        .head(TOP_N)
+    )
+
+    accel = (
+        df_all[df_all["Delta"] > DELTA_MIN]
+        .sort_values("Delta", ascending=False)
+    )
+
+    # 📤 DISCORD — TOP RANKING UNIQUEMENT
+    if not top.empty:
+        send_discord_ranking(top)
 
     st.subheader("🏆 TOP RANKING")
     st.dataframe(top, use_container_width=True)
