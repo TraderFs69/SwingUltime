@@ -1,157 +1,170 @@
-# =====================================================
-# SWING SCANNER — RANKING & ACCÉLÉRATION + DISCORD
-# =====================================================
-import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
-import time
-from datetime import date, timedelta
+import os
+from datetime import datetime, timedelta
 
-# ---------------- CONFIG ----------------
-st.set_page_config(layout="wide")
-st.title("🚀 Swing Scanner — Ranking & Accélération")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-POLYGON_KEY = st.secrets["POLYGON_API_KEY"]
-DISCORD_WEBHOOK = st.secrets["DISCORD_WEBHOOK_URL"]
+# ==============================
+# LOAD SP500
+# ==============================
+def load_sp500():
+    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
+    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
-LOOKBACK = 160
-TOP_N = 10
-DELTA_MIN = 5
+# ==============================
+# GET DATA
+# ==============================
+def get_data(ticker):
+    end = datetime.today()
+    start = end - timedelta(days=150)
 
-# ---------------- SESSION ----------------
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "TradingEnAction-SwingRanking/1.0"})
-
-# ---------------- LOAD TICKERS ----------------
-@st.cache_data
-def load_tickers():
-    df = pd.read_excel("russell3000_constituents.xlsx")
-    return (
-        df.iloc[:, 0]
-        .dropna()
-        .astype(str)
-        .str.upper()
-        .unique()
-        .tolist()
-    )
-
-TICKERS = load_tickers()
-
-# ---------------- POLYGON ----------------
-def get_ohlc(ticker, retries=2):
-    end = date.today()
-    start = end - timedelta(days=LOOKBACK)
-
-    url = (
-        f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
-        f"{start}/{end}?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_KEY}"
-    )
-
-    for _ in range(retries):
-        try:
-            r = SESSION.get(url, timeout=20)
-            if r.status_code != 200:
-                return None
-
-            data = r.json()
-            if not data.get("results"):
-                return None
-
-            df = pd.DataFrame(data["results"])
-            df["Close"] = df["c"]
-            return df
-
-        except requests.exceptions.Timeout:
-            time.sleep(0.5)
-        except Exception:
-            return None
-
-    return None
-
-# ---------------- INDICATEURS ----------------
-def EMA(s, n): 
-    return s.ewm(span=n, adjust=False).mean()
-
-def ROC(s, n): 
-    return s.pct_change(n) * 100
-
-def compute_score(df):
-    c = df["Close"]
-    score = sum([
-        c.iloc[-1] > EMA(c, 50).iloc[-1],
-        EMA(c, 20).iloc[-1] > EMA(c, 20).iloc[-5],
-        ROC(c, 5).iloc[-1] > 0,
-        ROC(ROC(c, 5), 5).iloc[-1] > 0
-    ])
-    return round(score / 4 * 100, 2)
-
-# ---------------- DISCORD ----------------
-def send_discord_ranking(df):
-    lines = ["🏆 **SWING RANKING — TOP 10**\n"]
-
-    for i, row in enumerate(df.itertuples(), 1):
-        lines.append(
-            f"{i}️⃣ **{row.Ticker}** — Score {row.Score} — Δ {row.Delta:+}"
-        )
-
-    lines.append("\n⏱ Scan journalier — Trading en Action")
-
-    payload = {"content": "\n".join(lines)}
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start.date()}/{end.date()}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
 
     try:
-        requests.post(DISCORD_WEBHOOK, json=payload, timeout=5)
-    except Exception:
-        pass
+        r = requests.get(url).json()
+        if "results" not in r:
+            return None
 
-# ---------------- SCAN ----------------
-def scan_universe(tickers):
-    rows = []
-    progress = st.progress(0)
+        df = pd.DataFrame(r["results"])
+        df["Date"] = pd.to_datetime(df["t"], unit="ms")
+        df.set_index("Date", inplace=True)
+        df = df.rename(columns={"c": "close"})
 
-    for i, t in enumerate(tickers):
-        df = get_ohlc(t)
+        return df[["close"]]
+    except:
+        return None
+
+# ==============================
+# INDICATORS
+# ==============================
+def add_indicators(df):
+    df["EMA20"] = df["close"].ewm(span=20).mean()
+    df["EMA50"] = df["close"].ewm(span=50).mean()
+    df["EMA200"] = df["close"].ewm(span=200).mean()
+
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    return df
+
+# ==============================
+# PULLBACK CHECK
+# ==============================
+def is_pullback(df):
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    price = latest["close"]
+
+    # Trend
+    if not (price > latest["EMA50"] > latest["EMA200"]):
+        return False
+
+    # Pullback zone
+    if abs(price - latest["EMA20"]) / latest["EMA20"] > 0.03:
+        return False
+
+    # RSI
+    if not (40 < latest["RSI"] < 60):
+        return False
+
+    # Rebond (bougie verte)
+    if not (latest["close"] > prev["close"]):
+        return False
+
+    # Anti crash
+    if latest["close"] < df["close"].iloc[-10]:
+        return False
+
+    return True
+
+# ==============================
+# SIMPLE SCORE
+# ==============================
+def score(df):
+    latest = df.iloc[-1]
+
+    dist = abs(latest["close"] - latest["EMA20"]) / latest["EMA20"]
+    rsi = latest["RSI"]
+
+    s = 0
+
+    # Proximité EMA20
+    if dist < 0.01:
+        s += 3
+    elif dist < 0.02:
+        s += 2
+    else:
+        s += 1
+
+    # RSI idéal
+    if 45 < rsi < 55:
+        s += 3
+    else:
+        s += 1
+
+    # Momentum court terme
+    if df["close"].iloc[-1] > df["close"].iloc[-3]:
+        s += 2
+
+    return s
+
+# ==============================
+# SCAN
+# ==============================
+def scan():
+    tickers = load_sp500()
+    results = []
+
+    for ticker in tickers:
+        df = get_data(ticker)
         if df is None or len(df) < 100:
             continue
 
-        score_today = compute_score(df)
-        score_week = compute_score(df.iloc[:-5])
+        df = add_indicators(df)
 
-        rows.append([
-            t,
-            round(df["Close"].iloc[-1], 2),
-            score_today,
-            round(score_today - score_week, 2)
-        ])
+        if is_pullback(df):
+            s = score(df)
 
-        progress.progress((i + 1) / len(tickers))
+            results.append({
+                "ticker": ticker,
+                "price": round(df["close"].iloc[-1], 2),
+                "score": s
+            })
 
-    return pd.DataFrame(
-        rows, columns=["Ticker", "Price", "Score", "Delta"]
-    )
+    df_res = pd.DataFrame(results)
 
-# ---------------- UI ----------------
-limit = st.slider("Nombre de tickers", 50, len(TICKERS), 200)
+    if df_res.empty:
+        return None
 
-if st.button("🚀 Scanner Swing"):
-    df_all = scan_universe(TICKERS[:limit])
+    return df_res.sort_values("score", ascending=False).head(10)
 
-    top = (
-        df_all
-        .sort_values("Score", ascending=False)
-        .head(TOP_N)
-    )
+# ==============================
+# DISCORD
+# ==============================
+def send_discord(df):
+    if df is None:
+        msg = "⚠️ Aucun pullback propre aujourd’hui"
+    else:
+        msg = "🟢 TEA PULLBACK CLEAN\n\n"
 
-    accel = (
-        df_all[df_all["Delta"] > DELTA_MIN]
-        .sort_values("Delta", ascending=False)
-    )
+        for _, row in df.iterrows():
+            msg += f"{row['ticker']} | {row['price']}$ | Score: {row['score']}\n"
 
-    # 📤 DISCORD — TOP RANKING UNIQUEMENT
-    if not top.empty:
-        send_discord_ranking(top)
+    requests.post(DISCORD_WEBHOOK_URL, json={"content": msg})
 
-    st.subheader("🏆 TOP RANKING")
-    st.dataframe(top, use_container_width=True)
+# ==============================
+# MAIN
+# ==============================
+def main():
+    df = scan()
+    send_discord(df)
 
-    st.subheader("⚡ ACCÉLÉRATEURS")
-    st.dataframe(accel, use_container_width=True)
+if __name__ == "__main__":
+    main()
