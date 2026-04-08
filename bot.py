@@ -1,29 +1,24 @@
 import pandas as pd
-import numpy as np
 import requests
 import os
 from datetime import datetime, timedelta
-import time
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# ==============================
+# -----------------------------
 # LOAD SP500
-# ==============================
+# -----------------------------
 def load_sp500():
-    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
+    url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
+    df = pd.read_csv(url)
     return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
-# ==============================
-# GET DATA (robuste)
-# ==============================
-def get_data(ticker):
-    end = datetime.today()
-    start = end - timedelta(days=150)
-
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start.date()}/{end.date()}?adjusted=true&sort=asc&limit=5000&apiKey={POLYGON_API_KEY}"
-
+# -----------------------------
+# FETCH DATA POLYGON
+# -----------------------------
+def get_data(ticker, start, end):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_API_KEY}"
     try:
         r = requests.get(url, timeout=10)
         data = r.json()
@@ -34,153 +29,127 @@ def get_data(ticker):
         df = pd.DataFrame(data["results"])
         df["Date"] = pd.to_datetime(df["t"], unit="ms")
         df.set_index("Date", inplace=True)
-        df = df.rename(columns={"c": "close"})
 
-        return df[["close"]]
-
+        return df
     except:
         return None
 
-# ==============================
+# -----------------------------
 # INDICATORS
-# ==============================
-def add_indicators(df):
-    df["EMA20"] = df["close"].ewm(span=20).mean()
-    df["EMA50"] = df["close"].ewm(span=50).mean()
-    df["EMA200"] = df["close"].ewm(span=200).mean()
+# -----------------------------
+def compute_indicators(df):
+    df["EMA9"] = df["c"].ewm(span=9).mean()
+    df["EMA20"] = df["c"].ewm(span=20).mean()
+    df["EMA50"] = df["c"].ewm(span=50).mean()
 
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    rs = gain.rolling(14).mean() / loss.rolling(14).mean()
-    df["RSI"] = 100 - (100 / (1 + rs))
+    df["RET"] = df["c"].pct_change()
+    df["VOL"] = df["v"]
 
     return df
 
-# ==============================
-# PULLBACK CHECK
-# ==============================
-def is_pullback(df):
-    latest = df.iloc[-1]
+# -----------------------------
+# SCORE TEA
+# -----------------------------
+def compute_score(df):
+    if len(df) < 50:
+        return None
+
+    last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    price = latest["close"]
+    score = 0
 
     # Trend
-    if not (price > latest["EMA50"] > latest["EMA200"]):
-        return False
+    if last["EMA9"] > last["EMA20"]:
+        score += 2
+    if last["EMA20"] > last["EMA50"]:
+        score += 2
 
-    # Pullback zone
-    if abs(price - latest["EMA20"]) / latest["EMA20"] > 0.03:
-        return False
+    # Momentum
+    if last["RET"] > 0:
+        score += 2
 
-    # RSI sain
-    if not (40 < latest["RSI"] < 60):
-        return False
+    # Volume spike
+    if last["VOL"] > df["VOL"].rolling(20).mean().iloc[-1]:
+        score += 2
 
-    # Rebond (bougie verte)
-    if not (latest["close"] > prev["close"]):
-        return False
+    # Pullback propre
+    if prev["c"] < prev["EMA9"] and last["c"] > last["EMA9"]:
+        score += 2
 
-    # Anti crash (évite couteaux qui tombent)
-    if latest["close"] < df["close"].iloc[-10]:
-        return False
+    return score
 
-    return True
-
-# ==============================
-# SCORE SIMPLE
-# ==============================
-def score(df):
-    latest = df.iloc[-1]
-
-    dist = abs(latest["close"] - latest["EMA20"]) / latest["EMA20"]
-    rsi = latest["RSI"]
-
-    s = 0
-
-    # Proximité EMA20
-    if dist < 0.01:
-        s += 3
-    elif dist < 0.02:
-        s += 2
-    else:
-        s += 1
-
-    # RSI optimal
-    if 45 < rsi < 55:
-        s += 3
-    else:
-        s += 1
-
-    # Momentum court terme
-    if df["close"].iloc[-1] > df["close"].iloc[-3]:
-        s += 2
-
-    return s
-
-# ==============================
+# -----------------------------
 # SCAN
-# ==============================
-def scan():
+# -----------------------------
+def scan_market():
     tickers = load_sp500()
+
+    end_date = datetime.now() - timedelta(days=1)
+    start_date = end_date - timedelta(days=120)
+
+    start = start_date.strftime("%Y-%m-%d")
+    end = end_date.strftime("%Y-%m-%d")
+
     results = []
 
-    for ticker in tickers:
-        df = get_data(ticker)
-        if df is None or len(df) < 100:
+    for t in tickers[:150]:  # 🔥 rapide (tu peux augmenter)
+        df = get_data(t, start, end)
+        if df is None or len(df) < 50:
             continue
 
-        df = add_indicators(df)
+        df = compute_indicators(df)
+        score = compute_score(df)
 
-        if is_pullback(df):
-            s = score(df)
+        if score is not None:
+            results.append((t, score, df["c"].iloc[-1]))
 
-            results.append({
-                "ticker": ticker,
-                "price": round(df["close"].iloc[-1], 2),
-                "score": s
-            })
-
-        # évite limite API
-        time.sleep(0.2)
-
-    df_res = pd.DataFrame(results)
+    df_res = pd.DataFrame(results, columns=["ticker", "score", "price"])
 
     if df_res.empty:
-        return None
+        return df_res
 
     return df_res.sort_values("score", ascending=False).head(10)
 
-# ==============================
+# -----------------------------
 # DISCORD
-# ==============================
-def send_discord(df):
-    if df is None:
-        msg = "⚠️ Aucun pullback propre aujourd’hui"
-    else:
-        msg = "🟢 TEA PULLBACK CLEAN\n\n"
+# -----------------------------
+def send_discord(message):
+    data = {"content": message}
+    requests.post(DISCORD_WEBHOOK_URL, json=data)
 
-        for _, row in df.iterrows():
-            msg += f"{row['ticker']} | {row['price']}$ | Score: {row['score']}\n"
+# -----------------------------
+# BUILD REPORT
+# -----------------------------
+def build_report(df):
+    report = "🟫 TEA ELITE RECAP\n\n"
 
-    try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"content": msg}, timeout=10)
-    except:
-        print("Erreur envoi Discord")
+    for _, row in df.iterrows():
+        report += f"{row['ticker']} | Score: {row['score']} | Price: {round(row['price'],2)}\n"
 
-# ==============================
+    report += "\n🧠 Lecture rapide:\nMomentum + structure propre.\n"
+
+    return report
+
+# -----------------------------
 # MAIN
-# ==============================
+# -----------------------------
 def main():
-    print("🔎 Scan en cours...")
-    df = scan()
+    print("🔄 Scan en cours...")
 
-    if df is not None:
-        print(df)
+    df = scan_market()
 
-    send_discord(df)
-    print("✅ Terminé")
+    print("Résultats trouvés:", len(df))
+
+    # 🔥 FALLBACK SI VIDE
+    if df.empty:
+        message = "⚠️ Aucun setup valide aujourd’hui — marché faible ou données non prêtes"
+    else:
+        message = build_report(df)
+
+    send_discord(message)
+
+    print("✅ Envoyé sur Discord")
 
 if __name__ == "__main__":
     main()
