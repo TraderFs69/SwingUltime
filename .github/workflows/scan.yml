@@ -2,7 +2,8 @@ name: TEA Elite Recap
 
 on:
   schedule:
-    - cron: "30 1 * * 2-6"  # 21h30 Québec
+    - cron: '0 0 * * *'  # 20h Québec = 00h UTC
+    - cron: '0 23 * * *'  # ~20h Québec
   workflow_dispatch:
 
 jobs:
