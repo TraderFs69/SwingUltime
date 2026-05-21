@@ -10,9 +10,18 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # ==============================
 # LOAD SP500
 # ==============================
+import pandas as pd
+
 def load_sp500():
-    df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv")
-    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv"
+
+    try:
+        df = pd.read_csv(url)
+        return df["Symbol"].tolist()
+
+    except Exception as e:
+        print("Erreur chargement S&P500:", e)
+        return []
 
 # ==============================
 # GET DATA
