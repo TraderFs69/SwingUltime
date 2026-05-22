@@ -2,7 +2,12 @@ name: TEA Elite Recap
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # 20h Québec = 00h UTC
+    # 20h Québec hiver (UTC-5)
+    - cron: '0 1 * * *'
+
+    # 20h Québec été (UTC-4)
+    - cron: '0 0 * * *'
+
   workflow_dispatch:
 
 jobs:
@@ -10,19 +15,60 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Debug current time
+        run: |
+          echo "UTC TIME:"
+          date -u
+          echo "LOCAL SERVER TIME:"
+          date
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Verify secrets
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          echo "Checking secrets..."
+
+          if [ -z "$POLYGON_API_KEY" ]; then
+            echo "POLYGON_API_KEY is missing"
+          else
+            echo "POLYGON_API_KEY exists"
+          fi
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_WEBHOOK_URL is missing"
+          else
+            echo "DISCORD_WEBHOOK_URL exists"
+          fi
 
       - name: Run bot
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python bot.py
+        run: |
+          echo "===================="
+          echo "STARTING TEA ELITE RECAP"
+          echo "===================="
+
+          python bot.py
+
+          echo "===================="
+          echo "BOT FINISHED"
+          echo "===================="
