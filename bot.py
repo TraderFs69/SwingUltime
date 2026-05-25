@@ -1,46 +1,95 @@
 import pandas as pd
 import requests
 import os
+import time
 from datetime import datetime, timedelta
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
+MAX_TICKERS = 150
+LOOKBACK_DAYS = 160
+REQUEST_SLEEP = 0.08
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "TEA-Elite-Recap/1.0",
+    "Accept-Encoding": "gzip",
+})
+
 # -----------------------------
-# LOAD SP500
+# LOAD RUSSELL 3000
 # -----------------------------
 def load_sp500():
-    url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-    df = pd.read_csv(url)
-    return df["Symbol"].str.replace(".", "-", regex=False).tolist()
+    df = pd.read_excel("russell3000_constituents.xlsx")
+
+    tickers = (
+        df.iloc[:, 0]
+        .dropna()
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+
+    tickers = [
+        t.replace(".", "-")
+        for t in tickers
+        if t and t != "SYMBOL"
+    ]
+
+    print(f"✅ {len(tickers)} tickers chargés depuis russell3000_constituents.xlsx")
+    return tickers
 
 # -----------------------------
 # FETCH DATA POLYGON
 # -----------------------------
-def get_data(ticker, start, end):
-    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}?adjusted=true&sort=asc&limit=500&apiKey={POLYGON_API_KEY}"
-    try:
-        r = requests.get(url, timeout=10)
-        data = r.json()
+def get_data(ticker, start, end, retries=3):
+    url = f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
 
-        if "results" not in data:
-            return None
+    params = {
+        "adjusted": "true",
+        "sort": "asc",
+        "limit": 5000,
+        "apiKey": POLYGON_API_KEY,
+    }
 
-        df = pd.DataFrame(data["results"])
-        df["Date"] = pd.to_datetime(df["t"], unit="ms")
-        df.set_index("Date", inplace=True)
+    for attempt in range(retries):
+        try:
+            r = SESSION.get(url, params=params, timeout=(5, 25))
 
-        return df
-    except:
-        return None
+            if r.status_code != 200:
+                print(f"⚠️ {ticker} status {r.status_code}")
+                time.sleep(0.4 * (attempt + 1))
+                continue
+
+            data = r.json()
+
+            if not data.get("results"):
+                return None
+
+            df = pd.DataFrame(data["results"])
+            df["Date"] = pd.to_datetime(df["t"], unit="ms")
+            df.set_index("Date", inplace=True)
+
+            return df
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ {ticker} tentative {attempt + 1}: {e}")
+            time.sleep(0.5 * (attempt + 1))
+
+    return None
 
 # -----------------------------
 # INDICATORS
 # -----------------------------
 def compute_indicators(df):
-    df["EMA9"] = df["c"].ewm(span=9).mean()
-    df["EMA20"] = df["c"].ewm(span=20).mean()
-    df["EMA50"] = df["c"].ewm(span=50).mean()
+    df = df.copy()
+
+    df["EMA9"] = df["c"].ewm(span=9, adjust=False).mean()
+    df["EMA20"] = df["c"].ewm(span=20, adjust=False).mean()
+    df["EMA50"] = df["c"].ewm(span=50, adjust=False).mean()
 
     df["RET"] = df["c"].pct_change()
     df["VOL"] = df["v"]
@@ -59,21 +108,19 @@ def compute_score(df):
 
     score = 0
 
-    # Trend
     if last["EMA9"] > last["EMA20"]:
         score += 2
+
     if last["EMA20"] > last["EMA50"]:
         score += 2
 
-    # Momentum
     if last["RET"] > 0:
         score += 2
 
-    # Volume spike
-    if last["VOL"] > df["VOL"].rolling(20).mean().iloc[-1]:
+    vol_mean = df["VOL"].rolling(20).mean().iloc[-1]
+    if pd.notna(vol_mean) and last["VOL"] > vol_mean:
         score += 2
 
-    # Pullback propre
     if prev["c"] < prev["EMA9"] and last["c"] > last["EMA9"]:
         score += 2
 
@@ -86,15 +133,19 @@ def scan_market():
     tickers = load_sp500()
 
     end_date = datetime.now() - timedelta(days=1)
-    start_date = end_date - timedelta(days=120)
+    start_date = end_date - timedelta(days=LOOKBACK_DAYS)
 
     start = start_date.strftime("%Y-%m-%d")
     end = end_date.strftime("%Y-%m-%d")
 
     results = []
 
-    for t in tickers[:150]:  # 🔥 rapide (tu peux augmenter)
+    for i, t in enumerate(tickers[:MAX_TICKERS], 1):
+        print(f"🔎 {i}/{min(MAX_TICKERS, len(tickers))} — {t}")
+
         df = get_data(t, start, end)
+        time.sleep(REQUEST_SLEEP)
+
         if df is None or len(df) < 50:
             continue
 
@@ -115,17 +166,35 @@ def scan_market():
 # DISCORD
 # -----------------------------
 def send_discord(message):
-    data = {"content": message}
-    requests.post(DISCORD_WEBHOOK_URL, json=data)
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ DISCORD_WEBHOOK_URL manquant")
+        return
+
+    try:
+        r = requests.post(
+            DISCORD_WEBHOOK_URL,
+            json={"content": message},
+            timeout=10
+        )
+
+        if r.status_code not in [200, 204]:
+            print(f"⚠️ Discord status: {r.status_code} | {r.text}")
+
+    except Exception as e:
+        print("❌ Erreur Discord:", e)
 
 # -----------------------------
 # BUILD REPORT
 # -----------------------------
 def build_report(df):
-    report = "🟫 TEA ELITE RECAP\n\n"
+    report = "🟫 **TEA ELITE RECAP**\n\n"
 
     for _, row in df.iterrows():
-        report += f"{row['ticker']} | Score: {row['score']} | Price: {round(row['price'],2)}\n"
+        report += (
+            f"**{row['ticker']}** | "
+            f"Score: {row['score']} | "
+            f"Price: ${round(row['price'], 2)}\n"
+        )
 
     report += "\n🧠 Lecture rapide:\nMomentum + structure propre.\n"
 
@@ -135,15 +204,20 @@ def build_report(df):
 # MAIN
 # -----------------------------
 def main():
+    if not POLYGON_API_KEY:
+        raise RuntimeError("POLYGON_API_KEY manquant")
+
+    print("====================")
+    print("STARTING TEA ELITE RECAP")
+    print("====================")
     print("🔄 Scan en cours...")
 
     df = scan_market()
 
     print("Résultats trouvés:", len(df))
 
-    # 🔥 FALLBACK SI VIDE
     if df.empty:
-        message = "⚠️ Aucun setup valide aujourd’hui — marché faible ou données non prêtes"
+        message = "⚠️ Aucun setup valide aujourd’hui — marché faible ou données non prêtes."
     else:
         message = build_report(df)
 
