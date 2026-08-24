@@ -33,7 +33,7 @@ from urllib3.util.retry import Retry
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-CONSTITUENTS_FILE = Path("sp500_constituents.xlsx")
+CONSTITUENTS_FILE = Path("russell3000_constituents.xlsx")
 OUTPUT_CSV = Path("tea_pullback_resultats.csv")
 
 LOOKBACK_DAYS = 550
