@@ -1,6 +1,6 @@
 """TEA Pullback - scanner S&P 500 avec Yahoo Finance.
 
-Le fichier ``sp500_constituents.xlsx`` doit etre place dans le meme dossier.
+Le fichier ``russell3000_constituents.xlsx`` doit etre place dans le meme dossier.
 Il doit contenir une colonne ``Symbol`` (ou une colonne dont le nom contient
 "sym"). Une colonne ``Sector`` est utilisee lorsqu'elle est disponible.
 
